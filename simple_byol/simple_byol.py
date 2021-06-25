@@ -9,22 +9,13 @@ import torch.nn.functional as F
 
 from torchvision import transforms as T
 
-
 # helper functions
-
-# 如果值为空，返回自定义的默认值
 def default(val, def_val):
     return def_val if val is None else val
 
-
-# 展成一维
 def flatten(t):
     return t.reshape(t.shape[0], -1)
 
-
-# 定义了一个带参数的装饰器方法
-# 如果被装饰的方法，cache_key属性值不为None,返回其值
-# 如果被装饰的方法，cache_key属性值为None,将该属性赋值为：cache_key，并返回其值
 def singleton(cache_key):
     def inner_fn(fn):
         @wraps(fn)
@@ -36,43 +27,35 @@ def singleton(cache_key):
             instance = fn(self, *args, **kwargs)
             setattr(self, cache_key, instance)
             return instance
-
         return wrapper
-
     return inner_fn
 
-
 def get_module_device(module):
-    # next用于返回迭代器的下一个项目
     return next(module.parameters()).device
-
 
 def set_requires_grad(model, val):
     for p in model.parameters():
         p.requires_grad = val
 
-
 # loss fn
-# 没大看明白这个损失函数的含义
+
 def loss_fn(x, y):
-    x = F.normalize(x, dim=-1)
-    y = F.normalize(y, dim=-1)
+    x = F.normalize(x, dim=-1, p=2)#l2正则化
+    y = F.normalize(y, dim=-1, p=2)
     return 2 - 2 * (x * y).sum(dim=-1)
 
 
 # augmentation utils
-# 随机增广，有可能不如我写的好呢
+
 class RandomApply(nn.Module):
     def __init__(self, fn, p):
         super().__init__()
         self.fn = fn
         self.p = p
-
     def forward(self, x):
         if random.random() > self.p:
             return x
         return self.fn(x)
-
 
 # exponential moving average
 class EMA():
@@ -84,21 +67,16 @@ class EMA():
         if old is None:
             return new
         return old * self.beta + (1 - self.beta) * new
-        # 就是论文中提到的 exponential moving average
-        # 暂时没看明白有什么用
 
-
-# zip将两个列表，按照最短长度，将两个列表中对应位置的元素打包为一个元组，产生新的元组列表
 def update_moving_average(ema_updater, ma_model, current_model):
     for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
         old_weight, up_weight = ma_params.data, current_params.data
         ma_params.data = ema_updater.update_average(old_weight, up_weight)
 
-
-# 就是一个简单的神经单元，做一个非线性处理
 # MLP class for projector and predictor
+
 class MLP(nn.Module):
-    def __init__(self, dim, projection_size, hidden_size=4096):
+    def __init__(self, dim, projection_size, hidden_size = 4096):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(dim, hidden_size),
@@ -110,27 +88,29 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-
 # a wrapper class for the base neural network
 # will manage the interception of the hidden layer output
 # and pipe it into the projecter and predictor nets
 
-# encoder+projector
 class NetWrapper(nn.Module):
-
-    def __init__(self, net, projection_size, projection_hidden_size, layer=-2):
+    """
+    #online
+    projection_size = 256,
+    projection_hidden_size = 4096,
+    hidden_layer = -2,#'avgpool',  样例传入avgpool
+    """
+    def __init__(self, net, projection_size, projection_hidden_size, layer = -2):
         super().__init__()
         self.net = net
-        self.layer = layer
-
+        self.layer = layer#avgpool
         self.projector = None
         self.projection_size = projection_size
         self.projection_hidden_size = projection_hidden_size
-
         self.hidden = {}
         self.hook_registered = False
 
     def _find_layer(self):
+        print("_find_layer")
         if type(self.layer) == str:
             modules = dict([*self.net.named_modules()])
             return modules.get(self.layer, None)
@@ -151,19 +131,19 @@ class NetWrapper(nn.Module):
 
     @singleton('projector')
     def _get_projector(self, hidden):
+        print("_get_projector")
         _, dim = hidden.shape
         projector = MLP(dim, self.projection_size, self.projection_hidden_size)
         return projector.to(hidden)
 
     def get_representation(self, x):
-
+        print("get_representation")
         if self.layer == -1:
             return self.net(x)
 
         if not self.hook_registered:
             self._register_hook()
 
-        # kk=self.net()
         self.hidden.clear()
         _ = self.net(x)
         hidden = self.hidden[x.device]
@@ -172,7 +152,8 @@ class NetWrapper(nn.Module):
         assert hidden is not None, f'hidden layer {self.layer} never emitted an output'
         return hidden
 
-    def forward(self, x, return_projection=True):
+    def forward(self, x, return_projection = True):
+        print("wrap forward")
         representation = self.get_representation(x)
 
         if not return_projection:
@@ -182,40 +163,41 @@ class NetWrapper(nn.Module):
         projection = projector(representation)
         return projection, representation
 
-
 # main class
 
 class BYOL(nn.Module):
-
+    """
+    resnet,
+    image_size = 256,
+    hidden_layer = 'avgpool',
+    use_momentum = False       # turn off momentum in the target encoder
+    """
     def __init__(
-            self,
-            net,
-            image_size,
-
-            hidden_layer=-2,#特征提取的最后一层罢了
-            projection_size=256,
-            projection_hidden_size=4096,
-
-            augment_fn=None,
-            augment_fn2=None,
-            moving_average_decay=0.99,
-            use_momentum=True
+        self,
+        net,
+        image_size,
+        hidden_layer = -2,#'avgpool',
+        projection_size = 256,
+        projection_hidden_size = 4096,
+        augment_fn = None,
+        augment_fn2 = None,
+        moving_average_decay = 0.99,
+        use_momentum = True#False
     ):
         super().__init__()
         self.net = net
-
         # default SimCLR augmentation
 
         DEFAULT_AUG = torch.nn.Sequential(
             RandomApply(
                 T.ColorJitter(0.8, 0.8, 0.8, 0.2),
-                p=0.3
+                p = 0.3
             ),
             T.RandomGrayscale(p=0.2),
             T.RandomHorizontalFlip(),
             RandomApply(
                 T.GaussianBlur((3, 3), (1.0, 2.0)),
-                p=0.2
+                p = 0.2
             ),
             T.RandomResizedCrop((image_size, image_size)),
             T.Normalize(
@@ -224,20 +206,31 @@ class BYOL(nn.Module):
         )
 
         self.augment1 = default(augment_fn, DEFAULT_AUG)
+        #如果第一个参数为空，则augment=第二个参数
         self.augment2 = default(augment_fn2, self.augment1)
 
+        #创建
+        #projection_size = 256,
+        #projection_hidden_size = 4096,
+        #hidden_layer = -2,#'avgpool',  样例传入avgpool
         self.online_encoder = NetWrapper(net, projection_size, projection_hidden_size, layer=hidden_layer)
 
+        #false
         self.use_momentum = use_momentum
         self.target_encoder = None
+
+        #这里在后来的方法中没有用到，去掉也没事
         self.target_ema_updater = EMA(moving_average_decay)
 
+        # projection_size = 256,
+        # projection_hidden_size = 4096,
+        # hidden_layer = -2,#'avgpool',  样例传入avgpool
         self.online_predictor = MLP(projection_size, projection_size, projection_hidden_size)
 
         # get device of network and make wrapper same device
-        device = get_module_device(net)
-        self.to(device)
-
+        device = get_module_device(net)#看看你的net放到了cpu还是gpu
+        self.to(device)#把自己的模型也放到这个设备上
+        print("device:{}".format(device))
         # send a mock image tensor to instantiate singleton parameters
         self.forward(torch.randn(2, 3, image_size, image_size, device=device))
 
@@ -257,36 +250,31 @@ class BYOL(nn.Module):
         update_moving_average(self.target_ema_updater, self.target_encoder, self.online_encoder)
 
     def forward(
-            self,
-            x,
-            return_embedding=False,
-            return_projection=True
+        self,
+        x,
+        return_embedding = False,
+        return_projection = True
     ):
-        #反正也不执行，写这个是为了什么呢？
-        if return_embedding:
-            return self.online_encoder(x, return_projection=return_projection)
 
-        #图像增广
+        #return_embedding is False 不执行
+        if return_embedding:
+            return self.online_encoder(x, return_projection = return_projection)
+
+        #
         image_one, image_two = self.augment1(x), self.augment2(x)
 
-        #两个结果分别是：projection, representation
         online_proj_one, _ = self.online_encoder(image_one)
         online_proj_two, _ = self.online_encoder(image_two)
 
-        #两个预测值
         online_pred_one = self.online_predictor(online_proj_one)
         online_pred_two = self.online_predictor(online_proj_two)
 
-        #with用于对资源进行访问的场景，不管中间是否发生异常，都会执行必要的“清理操作”
         with torch.no_grad():
-            #没用momentum 所以 target_encoder=online_encoder,我猜测有可能是初始的原因？
-            #没看明白，这不是只有一个权重了吗？
             target_encoder = self._get_target_encoder() if self.use_momentum else self.online_encoder
             target_proj_one, _ = target_encoder(image_one)
             target_proj_two, _ = target_encoder(image_two)
             target_proj_one.detach_()
             target_proj_two.detach_()
-            # 在x->y->z传播中，如果我们对y进行detach()，梯度还是能正常传播的，但如果我们对y进行detach_()，就把x->y->z切成两部分：x和y->z，x就无法接受到后面传过来的梯度
 
         loss_one = loss_fn(online_pred_one, target_proj_two.detach())
         loss_two = loss_fn(online_pred_two, target_proj_one.detach())
